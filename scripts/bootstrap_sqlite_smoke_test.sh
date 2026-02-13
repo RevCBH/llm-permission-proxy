@@ -31,6 +31,7 @@ export BIND_ADDR="127.0.0.1:${PORT}"
 export BASE_URL="http://127.0.0.1:${PORT}"
 export WEBAUTHN_RP_ID="127.0.0.1"
 export WEBAUTHN_ORIGIN="http://127.0.0.1:${PORT}"
+export ALLOW_INSECURE_DEFAULTS="true"
 
 (
   cd "${REPO_ROOT}" &&
@@ -58,6 +59,18 @@ fi
 for column in algorithm public_key_format public_key_b64; do
   if ! sqlite3 "${DB_PATH}" "PRAGMA table_info(approver_credentials);" | cut -d'|' -f2 | grep -Fxq "${column}"; then
     echo "bootstrap failed: approver_credentials.${column} missing" >&2
+    exit 1
+  fi
+done
+
+if ! sqlite3 "${DB_PATH}" "PRAGMA table_info(capability_tokens);" | cut -d'|' -f2 | grep -Fxq "claims_hash"; then
+  echo "bootstrap failed: capability_tokens.claims_hash missing" >&2
+  exit 1
+fi
+
+for removed_column in nonce_plain resume_token_plain nonce_hash resume_token_hash; do
+  if sqlite3 "${DB_PATH}" "PRAGMA table_info(approvals);" | cut -d'|' -f2 | grep -Fxq "${removed_column}"; then
+    echo "bootstrap failed: approvals.${removed_column} should not exist" >&2
     exit 1
   fi
 done

@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use tracing::error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -29,6 +30,7 @@ pub enum AppError {
 
 impl AppError {
     pub fn internal<E: std::fmt::Display>(err: E) -> Self {
+        error!(error = %err, "internal application error");
         Self::Internal(err.to_string())
     }
 
@@ -52,11 +54,17 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg),
             AppError::Gone(msg) => (StatusCode::GONE, "gone", msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
-            AppError::PreconditionRequired(msg) => {
-                (StatusCode::PRECONDITION_REQUIRED, "precondition_required", msg)
-            }
+            AppError::PreconditionRequired(msg) => (
+                StatusCode::PRECONDITION_REQUIRED,
+                "precondition_required",
+                msg,
+            ),
             AppError::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
+            AppError::Internal(_msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal server error".to_string(),
+            ),
         };
 
         (status, Json(ProblemResponse { code, message })).into_response()

@@ -8,5 +8,6 @@ pub struct AppState {
     pub config: Config,
     pub db: SqlitePool,
     pub http_client: Client,
+    pub callback_http_client: Client,
     pub cf_executor: CloudflareExecutor,
 }

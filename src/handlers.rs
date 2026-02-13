@@ -7,29 +7,32 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, patch, post},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Acquire, Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, Transaction};
 
 use crate::{
     auth::{
-        AuthContext, capability_auth_middleware, ensure_ops_subset, ensure_scopes_subset,
-        ensure_task_access, extract_mtls_subject, issue_capability_token, make_capability_claims,
+        AuthContext, BootstrapAuthContext, bootstrap_auth_middleware, capability_auth_middleware,
+        capability_claims_hash, ensure_ops_subset, ensure_scopes_subset, ensure_task_access,
+        issue_capability_token, make_capability_claims,
     },
     callbacks::enqueue_callback_event,
     db::{new_id, random_token, sha256_hex, sha256_hex_bytes},
     error::AppError,
     models::{
         AgentPermissionItem, AgentPermissionsResponse, ApplyOperation, ApplyPendingResponse,
-        ApplyRequest, ApplySuccessResponse, ApprovalStatusResponse, ApproverCredentialItem,
-        ApproverCredentialsResponse, CallbackRegistrationInput, ContinueApplyRequest,
-        CreateApprovalRequest, CreateApprovalResponse, CreateTaskRequest, CreateTaskResponse,
-        DiscordApprovalMessageResponse, OperationExecutionResult, PatchAgentPermissionsRequest,
-        PermissionCheck, PermissionGap, PermissionLevel, PermissionTuple, ResourceScope, RiskTier,
-        TaskResponse, UpsertApproverCredentialRequest, WebAuthnAllowCredential,
-        WebAuthnOptionsResponse, WebAuthnVerifyRequest, WebAuthnVerifyResponse,
+        ApplyRequest, ApplySuccessResponse, ApprovalNonceClaims, ApprovalStatusResponse,
+        ApproverCredentialItem, ApproverCredentialsResponse, CallbackRegistrationInput,
+        ContinueApplyRequest, CreateApprovalRequest, CreateApprovalResponse, CreateTaskRequest,
+        CreateTaskResponse, DiscordApprovalMessageResponse, OperationExecutionResult,
+        PatchAgentPermissionsRequest, PermissionCheck, PermissionGap, PermissionLevel,
+        PermissionTuple, ResourceScope, ResumeTokenClaims, RiskTier, TaskResponse,
+        UpsertApproverCredentialRequest, WebAuthnAllowCredential, WebAuthnOptionsResponse,
+        WebAuthnVerifyRequest, WebAuthnVerifyResponse,
     },
     policy::operation_catalog_entry,
     state::AppState,
@@ -37,13 +40,22 @@ use crate::{
 };
 
 pub fn router(state: AppState) -> Router {
-    let protected = Router::new()
+    let task_routes = Router::new()
         .route("/v1/tasks/{task_id}", get(get_task))
         .route("/v1/tasks/{task_id}/plan", post(plan_task))
         .route("/v1/tasks/{task_id}/apply", post(apply_task))
-        .route("/v1/tasks/{task_id}/apply/continue", post(continue_apply_task))
-        .route("/v1/tasks/{task_id}/approval-status", get(get_approval_status))
-        .route("/v1/tasks/{task_id}/approve", post(create_approval_for_task))
+        .route(
+            "/v1/tasks/{task_id}/apply/continue",
+            post(continue_apply_task),
+        )
+        .route(
+            "/v1/tasks/{task_id}/approval-status",
+            get(get_approval_status),
+        )
+        .route(
+            "/v1/tasks/{task_id}/approve",
+            post(create_approval_for_task),
+        )
         .route(
             "/v1/tasks/{task_id}/approve/discord-message",
             get(get_discord_approval_message),
@@ -52,8 +64,21 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tasks/{task_id}/dns/create", post(dns_create))
         .route("/v1/tasks/{task_id}/cache/purge", post(cache_purge))
         .route("/v1/tasks/{task_id}/workers/deploy", post(workers_deploy))
-        .route("/v1/agents/{agent_id}/permissions", get(get_agent_permissions))
-        .route("/v1/agents/{agent_id}/permissions", patch(patch_agent_permissions))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            capability_auth_middleware,
+        ));
+
+    let admin_routes = Router::new()
+        .route("/v1/tasks", post(create_task))
+        .route(
+            "/v1/agents/{agent_id}/permissions",
+            get(get_agent_permissions),
+        )
+        .route(
+            "/v1/agents/{agent_id}/permissions",
+            patch(patch_agent_permissions),
+        )
         .route(
             "/v1/approvers/{approver_principal}/credentials",
             get(get_approver_credentials),
@@ -64,17 +89,20 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            capability_auth_middleware,
+            bootstrap_auth_middleware,
         ));
 
     Router::new()
         .route("/v1/healthz", get(healthz))
         .route("/v1/readyz", get(readyz))
-        .route("/v1/tasks", post(create_task))
         .route("/v1/approve/{approval_nonce}", get(approval_page))
-        .route("/v1/approve/{approval_nonce}/options", get(approval_options))
+        .route(
+            "/v1/approve/{approval_nonce}/options",
+            get(approval_options),
+        )
         .route("/v1/approve/{approval_nonce}/verify", post(approval_verify))
-        .merge(protected)
+        .merge(task_routes)
+        .merge(admin_routes)
         .with_state(state)
 }
 
@@ -89,9 +117,15 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
 
 async fn create_task(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(auth): Extension<BootstrapAuthContext>,
     Json(payload): Json<CreateTaskRequest>,
 ) -> Result<(StatusCode, Json<CreateTaskResponse>), AppError> {
+    if !auth.claims.can_issue_tasks {
+        return Err(AppError::Forbidden(
+            "bootstrap token cannot issue tasks".to_string(),
+        ));
+    }
+
     if payload.task_name.trim().is_empty() {
         return Err(AppError::BadRequest("task_name is required".to_string()));
     }
@@ -102,14 +136,8 @@ async fn create_task(
         ));
     }
 
-    let mtls_subject = extract_mtls_subject(&headers)?;
-    let agent_id = headers
-        .get("x-agent-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| AppError::Unauthorized("missing x-agent-id".to_string()))?
-        .to_string();
+    let mtls_subject = auth.mtls_subject.clone();
+    let agent_id = auth.agent_id();
 
     let task_id = new_id("task");
     let now = Utc::now();
@@ -135,6 +163,11 @@ async fn create_task(
     let mut scopes = HashSet::new();
 
     for operation in &payload.operations {
+        if operation.operation_id == "permissions.admin" {
+            return Err(AppError::Forbidden(
+                "permissions.admin cannot be included in task capabilities".to_string(),
+            ));
+        }
         let entry = operation_catalog_entry(&operation.operation_id).ok_or_else(|| {
             AppError::BadRequest(format!("unknown operation_id: {}", operation.operation_id))
         })?;
@@ -215,6 +248,7 @@ async fn create_task(
     );
 
     let token = issue_capability_token(&claims, &state.config.jwt_secret)?;
+    let claims_hash = capability_claims_hash(&claims)?;
 
     sqlx::query(
         r#"
@@ -227,11 +261,12 @@ async fn create_task(
           iss,
           allowed_ops_json,
           resource_scopes_json,
+          claims_hash,
           expires_at,
           revoked_at,
           rev,
           created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12)
         "#,
     )
     .bind(jti)
@@ -242,15 +277,35 @@ async fn create_task(
     .bind(state.config.jwt_issuer.clone())
     .bind(serde_json::to_string(&claims.allowed_ops).map_err(AppError::internal)?)
     .bind(serde_json::to_string(&claims.resource_scopes).map_err(AppError::internal)?)
-    .bind(chrono::DateTime::from_timestamp(claims.exp as i64, 0).ok_or_else(|| {
-        AppError::internal("failed to construct capability expiry timestamp")
-    })?)
-        .bind(perms_rev)
-        .bind(now)
+    .bind(claims_hash)
+    .bind(
+        chrono::DateTime::from_timestamp(claims.exp as i64, 0)
+            .ok_or_else(|| AppError::internal("failed to construct capability expiry timestamp"))?,
+    )
+    .bind(perms_rev)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let callback_id = if let Some(callback) = payload.callback.as_ref() {
+        let callback_id = register_callback(&state.config, &mut tx, &task_id, callback).await?;
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET callback_id = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+        )
+        .bind(callback_id.clone())
+        .bind(Utc::now())
+        .bind(task_id.clone())
         .execute(&mut *tx)
         .await?;
-
-    let callback_id = None::<String>;
+        Some(callback_id)
+    } else {
+        None
+    };
 
     tx.commit().await?;
 
@@ -305,7 +360,11 @@ async fn plan_task(
     ensure_task_access(&auth, &task_id)?;
     validate_task_operation_allowlist(&state, &task_id, &payload.operations).await?;
 
-    let op_ids: Vec<String> = payload.operations.iter().map(|o| o.operation_id.clone()).collect();
+    let op_ids: Vec<String> = payload
+        .operations
+        .iter()
+        .map(|o| o.operation_id.clone())
+        .collect();
     ensure_ops_subset(&auth, &op_ids)?;
     ensure_scopes_subset(
         &auth,
@@ -360,7 +419,9 @@ async fn apply_task(
     )
     .await?
     {
-        ApplyFlowOutcome::Pending(body) => Ok((StatusCode::ACCEPTED, Json(json!(body))).into_response()),
+        ApplyFlowOutcome::Pending(body) => {
+            Ok((StatusCode::ACCEPTED, Json(json!(body))).into_response())
+        }
         ApplyFlowOutcome::Success(body) => Ok((StatusCode::OK, Json(json!(body))).into_response()),
     }
 }
@@ -382,8 +443,18 @@ async fn continue_apply_task(
         .ok_or_else(|| AppError::BadRequest("Idempotency-Key header is required".to_string()))?
         .to_string();
 
-    match run_continue_flow(&state, &auth, &task_id, &idempotency_key, &payload.resume_token).await? {
-        ApplyFlowOutcome::Pending(body) => Ok((StatusCode::ACCEPTED, Json(json!(body))).into_response()),
+    match run_continue_flow(
+        &state,
+        &auth,
+        &task_id,
+        &idempotency_key,
+        &payload.resume_token,
+    )
+    .await?
+    {
+        ApplyFlowOutcome::Pending(body) => {
+            Ok((StatusCode::ACCEPTED, Json(json!(body))).into_response())
+        }
         ApplyFlowOutcome::Success(body) => Ok((StatusCode::OK, Json(json!(body))).into_response()),
     }
 }
@@ -432,7 +503,7 @@ async fn get_discord_approval_message(
 
     let row = sqlx::query(
         r#"
-        SELECT approval_id, expires_at, nonce_plain
+        SELECT approval_id, expires_at
         FROM approvals
         WHERE task_id = ?1
           AND state = 'pending'
@@ -447,7 +518,7 @@ async fn get_discord_approval_message(
 
     let approval_id: String = row.try_get("approval_id")?;
     let expires_at: chrono::DateTime<Utc> = row.try_get("expires_at")?;
-    let nonce_plain: String = row.try_get("nonce_plain")?;
+    let nonce_token = issue_approval_nonce_token(&state.config, &approval_id, expires_at)?;
 
     let expires_in = (expires_at - Utc::now()).num_seconds().max(0);
 
@@ -455,7 +526,7 @@ async fn get_discord_approval_message(
         approval_id,
         button_text: "Approve".to_string(),
         approver_summary: "Passkey approval required".to_string(),
-        approve_url: format!("{}/v1/approve/{}", state.config.base_url, nonce_plain),
+        approve_url: format!("{}/v1/approve/{}", state.config.base_url, nonce_token),
         expires_in_seconds: expires_in,
     }))
 }
@@ -558,7 +629,14 @@ async fn dns_create(
         callback: None,
     };
 
-    apply_task(State(state), Extension(auth), Path(task_id), headers, Json(apply_req)).await
+    apply_task(
+        State(state),
+        Extension(auth),
+        Path(task_id),
+        headers,
+        Json(apply_req),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,7 +671,14 @@ async fn cache_purge(
         callback: None,
     };
 
-    apply_task(State(state), Extension(auth), Path(task_id), headers, Json(apply_req)).await
+    apply_task(
+        State(state),
+        Extension(auth),
+        Path(task_id),
+        headers,
+        Json(apply_req),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -623,7 +708,14 @@ async fn workers_deploy(
         callback: None,
     };
 
-    apply_task(State(state), Extension(auth), Path(task_id), headers, Json(apply_req)).await
+    apply_task(
+        State(state),
+        Extension(auth),
+        Path(task_id),
+        headers,
+        Json(apply_req),
+    )
+    .await
 }
 
 async fn close_task(
@@ -667,12 +759,12 @@ async fn close_task(
 
 async fn get_agent_permissions(
     State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(auth): Extension<BootstrapAuthContext>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<AgentPermissionsResponse>, AppError> {
-    if !auth.is_admin() && auth.claims.agent_id != agent_id {
+    if !auth.claims.can_manage_permissions {
         return Err(AppError::Forbidden(
-            "cannot access permissions for another agent".to_string(),
+            "bootstrap token cannot access agent permissions".to_string(),
         ));
     }
 
@@ -710,13 +802,13 @@ async fn get_agent_permissions(
 
 async fn patch_agent_permissions(
     State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(auth): Extension<BootstrapAuthContext>,
     Path(agent_id): Path<String>,
     Json(payload): Json<PatchAgentPermissionsRequest>,
 ) -> Result<Json<AgentPermissionsResponse>, AppError> {
-    if !auth.is_admin() {
+    if !auth.claims.can_manage_permissions {
         return Err(AppError::Forbidden(
-            "admin capability required for permission updates".to_string(),
+            "bootstrap token cannot update agent permissions".to_string(),
         ));
     }
 
@@ -779,12 +871,12 @@ async fn patch_agent_permissions(
 
 async fn get_approver_credentials(
     State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(auth): Extension<BootstrapAuthContext>,
     Path(approver_principal): Path<String>,
 ) -> Result<Json<ApproverCredentialsResponse>, AppError> {
-    if !auth.is_admin() {
+    if !auth.claims.can_manage_approvers {
         return Err(AppError::Forbidden(
-            "admin capability required for approver credential access".to_string(),
+            "bootstrap token cannot access approver credentials".to_string(),
         ));
     }
 
@@ -820,18 +912,20 @@ async fn get_approver_credentials(
 
 async fn upsert_approver_credential(
     State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(auth): Extension<BootstrapAuthContext>,
     Path(approver_principal): Path<String>,
     Json(payload): Json<UpsertApproverCredentialRequest>,
 ) -> Result<Json<ApproverCredentialsResponse>, AppError> {
-    if !auth.is_admin() {
+    if !auth.claims.can_manage_approvers {
         return Err(AppError::Forbidden(
-            "admin capability required for approver credential updates".to_string(),
+            "bootstrap token cannot update approver credentials".to_string(),
         ));
     }
 
     if payload.credential_id.trim().is_empty() {
-        return Err(AppError::BadRequest("credential_id is required".to_string()));
+        return Err(AppError::BadRequest(
+            "credential_id is required".to_string(),
+        ));
     }
 
     if payload.status != "active" && payload.status != "inactive" {
@@ -845,7 +939,10 @@ async fn upsert_approver_credential(
         ));
     }
 
-    let algorithm = payload.algorithm.clone().unwrap_or_else(|| "ES256".to_string());
+    let algorithm = payload
+        .algorithm
+        .clone()
+        .unwrap_or_else(|| "ES256".to_string());
     let public_key_format = payload
         .public_key_format
         .clone()
@@ -890,18 +987,18 @@ async fn approval_page(
     State(state): State<AppState>,
     Path(approval_nonce): Path<String>,
 ) -> Result<Html<String>, AppError> {
-    let nonce_hash = sha256_hex(&approval_nonce);
+    let nonce_claims = decode_approval_nonce_token(&state.config, &approval_nonce)?;
 
     let row = sqlx::query(
         r#"
         SELECT approval_id, state, expires_at
         FROM approvals
-        WHERE nonce_hash = ?1
+        WHERE approval_id = ?1
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
-    .bind(nonce_hash)
+    .bind(nonce_claims.approval_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::NotFound("approval link not found".to_string()))?;
@@ -1012,7 +1109,7 @@ async fn approval_options(
     State(state): State<AppState>,
     Path(approval_nonce): Path<String>,
 ) -> Result<Json<WebAuthnOptionsResponse>, AppError> {
-    let nonce_hash = sha256_hex(&approval_nonce);
+    let nonce_claims = decode_approval_nonce_token(&state.config, &approval_nonce)?;
 
     let mut tx = state.db.begin().await?;
 
@@ -1020,12 +1117,12 @@ async fn approval_options(
         r#"
         SELECT id, approval_id, approver_principal, state, expires_at
         FROM approvals
-        WHERE nonce_hash = ?1
+        WHERE approval_id = ?1
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
-    .bind(nonce_hash)
+    .bind(nonce_claims.approval_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound("approval not found".to_string()))?;
@@ -1113,19 +1210,19 @@ async fn approval_verify(
         ));
     }
 
-    let nonce_hash = sha256_hex(&approval_nonce);
+    let nonce_claims = decode_approval_nonce_token(&state.config, &approval_nonce)?;
     let mut tx = state.db.begin().await?;
 
     let approval_row = sqlx::query(
         r#"
         SELECT id, approval_id, task_id, state, expires_at, approver_principal
         FROM approvals
-        WHERE nonce_hash = ?1
+        WHERE approval_id = ?1
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
-    .bind(nonce_hash)
+    .bind(nonce_claims.approval_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound("approval not found".to_string()))?;
@@ -1265,22 +1362,34 @@ enum ApplyFlowOutcome {
     Success(ApplySuccessResponse),
 }
 
+#[derive(Debug, Clone)]
+struct ResumeTokenValidation {
+    approval_id: String,
+    task_id: String,
+    operation_fingerprint: String,
+}
+
 async fn run_apply_flow(
     state: &AppState,
     auth: &AuthContext,
     task_id: &str,
     idempotency_key: &str,
     operations: Vec<ApplyOperation>,
-    expected_resume_token: Option<&str>,
+    expected_resume_token: Option<ResumeTokenValidation>,
 ) -> Result<ApplyFlowOutcome, AppError> {
     if operations.is_empty() {
-        return Err(AppError::BadRequest("operations cannot be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "operations cannot be empty".to_string(),
+        ));
     }
 
     validate_task_operation_allowlist(state, task_id, &operations).await?;
     validate_operation_params(&operations)?;
 
-    let op_ids: Vec<String> = operations.iter().map(|op| op.operation_id.clone()).collect();
+    let op_ids: Vec<String> = operations
+        .iter()
+        .map(|op| op.operation_id.clone())
+        .collect();
     let scope_pairs: Vec<(String, String)> = operations
         .iter()
         .map(|op| (op.scope_type.clone(), op.scope_id.clone()))
@@ -1327,7 +1436,8 @@ async fn run_apply_flow(
 
         if existing_status == "completed" || existing_status == "failed" {
             let response_json: String = row.try_get("response_json")?;
-            let body: ApplySuccessResponse = serde_json::from_str(&response_json).map_err(AppError::internal)?;
+            let body: ApplySuccessResponse =
+                serde_json::from_str(&response_json).map_err(AppError::internal)?;
             return Ok(ApplyFlowOutcome::Success(body));
         }
 
@@ -1336,11 +1446,16 @@ async fn run_apply_flow(
             let approval = fetch_approval_by_id(&mut tx, &approval_id).await?;
 
             if approval.state == "approved" {
-                if let Some(token) = expected_resume_token {
-                    let token_hash = sha256_hex(token);
-                    if approval.resume_token_hash != token_hash {
-                        return Err(AppError::Forbidden("resume token mismatch".to_string()));
-                    }
+                let Some(token) = expected_resume_token.as_ref() else {
+                    return Err(AppError::Forbidden(
+                        "resume token is required to continue approved apply requests".to_string(),
+                    ));
+                };
+                if token.approval_id != approval_id
+                    || token.task_id != task_id
+                    || token.operation_fingerprint != existing_fingerprint
+                {
+                    return Err(AppError::Forbidden("resume token mismatch".to_string()));
                 }
 
                 sqlx::query(
@@ -1381,7 +1496,8 @@ async fn run_apply_flow(
             }
 
             let response_json: String = row.try_get("response_json")?;
-            let body: ApplyPendingResponse = serde_json::from_str(&response_json).map_err(AppError::internal)?;
+            let body: ApplyPendingResponse =
+                serde_json::from_str(&response_json).map_err(AppError::internal)?;
             return Ok(ApplyFlowOutcome::Pending(body));
         }
 
@@ -1433,6 +1549,8 @@ async fn run_apply_flow(
         .await?;
     }
 
+    tx.commit().await?;
+
     let (permission_check, requires_approval) =
         evaluate_permissions(state, &auth.claims.agent_id, task_id, &operations).await?;
 
@@ -1458,6 +1576,8 @@ async fn run_apply_flow(
             callback_id: approval.callback_id.clone(),
             permission_check,
         };
+
+        let mut tx = state.db.begin().await?;
 
         sqlx::query(
             r#"
@@ -1503,7 +1623,6 @@ async fn run_apply_flow(
             Some(idempotency_key.to_string()),
             json!({
                 "approval_status_url": response.approval_status_url,
-                "resume_token": response.resume_token,
                 "permission_check": response.permission_check,
             }),
         )
@@ -1511,6 +1630,8 @@ async fn run_apply_flow(
 
         return Ok(ApplyFlowOutcome::Pending(response));
     }
+
+    let mut tx = state.db.begin().await?;
 
     sqlx::query(
         r#"
@@ -1529,15 +1650,7 @@ async fn run_apply_flow(
 
     tx.commit().await?;
 
-    execute_and_finalize(
-        state,
-        task_id,
-        idempotency_key,
-        key_hash,
-        operations,
-        None,
-    )
-    .await
+    execute_and_finalize(state, task_id, idempotency_key, key_hash, operations, None).await
 }
 
 async fn run_continue_flow(
@@ -1580,6 +1693,12 @@ async fn run_continue_flow(
     let request_json: String = row.try_get("request_json")?;
     let operations: Vec<ApplyOperation> =
         serde_json::from_str(&request_json).map_err(AppError::internal)?;
+    let resume_token_validation = decode_resume_token(&state.config, resume_token)?;
+    if resume_token_validation.task_id != task_id {
+        return Err(AppError::Forbidden(
+            "resume token does not belong to this task".to_string(),
+        ));
+    }
 
     run_apply_flow(
         state,
@@ -1587,7 +1706,7 @@ async fn run_continue_flow(
         task_id,
         idempotency_key,
         operations,
-        Some(resume_token),
+        Some(resume_token_validation),
     )
     .await
 }
@@ -1746,7 +1865,11 @@ async fn validate_task_operation_allowlist(
     }
 
     for op in operations {
-        if !allowed.contains(&(op.operation_id.clone(), op.scope_type.clone(), op.scope_id.clone())) {
+        if !allowed.contains(&(
+            op.operation_id.clone(),
+            op.scope_type.clone(),
+            op.scope_id.clone(),
+        )) {
             return Err(AppError::Forbidden(format!(
                 "operation {} on {}:{} not in task allowlist",
                 op.operation_id, op.scope_type, op.scope_id
@@ -1759,8 +1882,9 @@ async fn validate_task_operation_allowlist(
 
 fn validate_operation_params(operations: &[ApplyOperation]) -> Result<(), AppError> {
     for operation in operations {
-        let entry = operation_catalog_entry(&operation.operation_id)
-            .ok_or_else(|| AppError::BadRequest(format!("unknown operation {}", operation.operation_id)))?;
+        let entry = operation_catalog_entry(&operation.operation_id).ok_or_else(|| {
+            AppError::BadRequest(format!("unknown operation {}", operation.operation_id))
+        })?;
 
         if entry.risk_tier == RiskTier::Sensitive {
             // Sensitive operations still proceed through policy checks and approval flow.
@@ -1783,10 +1907,12 @@ fn validate_operation_params(operations: &[ApplyOperation]) -> Result<(), AppErr
                         }
                     }
                 }
-                if let Some(ttl) = operation.params.get("ttl").and_then(|v| v.as_i64()) {
-                    if !(60..=86400).contains(&ttl) {
-                        return Err(AppError::BadRequest("dns ttl must be 60..86400".to_string()));
-                    }
+                if let Some(ttl) = operation.params.get("ttl").and_then(|v| v.as_i64())
+                    && !(60..=86400).contains(&ttl)
+                {
+                    return Err(AppError::BadRequest(
+                        "dns ttl must be 60..86400".to_string(),
+                    ));
                 }
             }
             "cache.purge.execute" => {
@@ -1844,8 +1970,9 @@ async fn evaluate_permissions(
     let mut requires_approval = false;
 
     for op in operations {
-        let entry = operation_catalog_entry(&op.operation_id)
-            .ok_or_else(|| AppError::BadRequest(format!("unknown operation {}", op.operation_id)))?;
+        let entry = operation_catalog_entry(&op.operation_id).ok_or_else(|| {
+            AppError::BadRequest(format!("unknown operation {}", op.operation_id))
+        })?;
 
         let granted = fetch_best_permission_level(
             &state.db,
@@ -1964,9 +2091,7 @@ async fn fetch_best_permission_level(
 
 #[derive(Debug, Clone)]
 struct ApprovalRecord {
-    approval_id: String,
     state: String,
-    resume_token_hash: String,
 }
 
 async fn fetch_approval_by_id(
@@ -1975,7 +2100,7 @@ async fn fetch_approval_by_id(
 ) -> Result<ApprovalRecord, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT approval_id, state, resume_token_hash
+        SELECT state
         FROM approvals
         WHERE approval_id = ?1
         LIMIT 1
@@ -1987,9 +2112,7 @@ async fn fetch_approval_by_id(
     .ok_or_else(|| AppError::NotFound("approval not found".to_string()))?;
 
     Ok(ApprovalRecord {
-        approval_id: row.try_get("approval_id")?,
         state: row.try_get("state")?,
-        resume_token_hash: row.try_get("resume_token_hash")?,
     })
 }
 
@@ -2014,7 +2137,7 @@ async fn create_or_get_pending_approval(
 
     let existing = sqlx::query(
         r#"
-        SELECT approval_id, nonce_plain, resume_token_plain, expires_at
+        SELECT approval_id, operation_fingerprint, expires_at
         FROM approvals
         WHERE task_id = ?1
           AND operation_fingerprint = ?2
@@ -2036,15 +2159,22 @@ async fn create_or_get_pending_approval(
 
     if let Some(row) = existing {
         let approval_id: String = row.try_get("approval_id")?;
-        let nonce_plain: String = row.try_get("nonce_plain")?;
-        let resume_token: String = row.try_get("resume_token_plain")?;
+        let operation_fingerprint: String = row.try_get("operation_fingerprint")?;
         let expires_at: chrono::DateTime<Utc> = row.try_get("expires_at")?;
+        let approval_nonce = issue_approval_nonce_token(&state.config, &approval_id, expires_at)?;
+        let resume_token = issue_resume_token(
+            &state.config,
+            &approval_id,
+            task_id,
+            &operation_fingerprint,
+            expires_at,
+        )?;
         tx.commit().await?;
 
         return Ok(PendingApprovalCreateResult {
             approval_id,
             approval_status_url: format!("/v1/tasks/{task_id}/approval-status"),
-            approval_url: format!("/v1/approve/{nonce_plain}"),
+            approval_url: format!("/v1/approve/{approval_nonce}"),
             resume_token,
             callback_id,
             expires_at,
@@ -2052,12 +2182,6 @@ async fn create_or_get_pending_approval(
     }
 
     let approval_id = new_id("appr");
-    let nonce_plain = random_token(24);
-    let resume_token_plain = random_token(24);
-    let approval_url = format!("/v1/approve/{nonce_plain}");
-
-    let nonce_hash = sha256_hex(&nonce_plain);
-    let resume_token_hash = sha256_hex(&resume_token_plain);
     let expires_at = Utc::now() + Duration::seconds(state.config.approval_ttl_seconds);
 
     sqlx::query(
@@ -2066,10 +2190,6 @@ async fn create_or_get_pending_approval(
           id,
           task_id,
           approval_id,
-          nonce_hash,
-          nonce_plain,
-          resume_token_hash,
-          resume_token_plain,
           state,
           expires_at,
           operation_fingerprint,
@@ -2077,16 +2197,12 @@ async fn create_or_get_pending_approval(
           approver_principal,
           created_at,
           updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?12)
+        ) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?8)
         "#,
     )
     .bind(new_id("aprdb"))
     .bind(task_id)
     .bind(approval_id.clone())
-    .bind(nonce_hash)
-    .bind(&nonce_plain)
-    .bind(resume_token_hash)
-    .bind(resume_token_plain.clone())
     .bind(expires_at)
     .bind(operation_fingerprint)
     .bind(serde_json::to_string(&permission_check).map_err(AppError::internal)?)
@@ -2096,29 +2212,38 @@ async fn create_or_get_pending_approval(
     .await?;
 
     tx.commit().await?;
+    let approval_nonce = issue_approval_nonce_token(&state.config, &approval_id, expires_at)?;
+    let resume_token = issue_resume_token(
+        &state.config,
+        &approval_id,
+        task_id,
+        operation_fingerprint,
+        expires_at,
+    )?;
 
     Ok(PendingApprovalCreateResult {
         approval_id,
         approval_status_url: format!("/v1/tasks/{task_id}/approval-status"),
-        approval_url,
-        resume_token: resume_token_plain,
+        approval_url: format!("/v1/approve/{approval_nonce}"),
+        resume_token,
         callback_id,
         expires_at,
     })
 }
 
 async fn register_callback(
+    config: &crate::config::Config,
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
     callback: &CallbackRegistrationInput,
 ) -> Result<String, AppError> {
     let tx = &mut **tx;
 
-    if callback.url.trim().is_empty() {
-        return Err(AppError::BadRequest("callback.url is required".to_string()));
-    }
+    let callback_url = validate_callback_url(config, callback.url.as_str())?;
     if callback.secret.trim().is_empty() {
-        return Err(AppError::BadRequest("callback.secret is required".to_string()));
+        return Err(AppError::BadRequest(
+            "callback.secret is required".to_string(),
+        ));
     }
 
     let callback_id = new_id("cbk");
@@ -2152,7 +2277,7 @@ async fn register_callback(
     )
     .bind(callback_id.clone())
     .bind(task_id)
-    .bind(callback.url.clone())
+    .bind(callback_url.to_string())
     .bind(callback.secret.clone())
     .bind(serde_json::to_string(&events).map_err(AppError::internal)?)
     .bind(Utc::now())
@@ -2160,6 +2285,40 @@ async fn register_callback(
     .await?;
 
     Ok(callback_id)
+}
+
+fn validate_callback_url(config: &crate::config::Config, raw: &str) -> Result<Url, AppError> {
+    if raw.trim().is_empty() {
+        return Err(AppError::BadRequest("callback.url is required".to_string()));
+    }
+
+    let url = Url::parse(raw)
+        .map_err(|_| AppError::BadRequest("callback.url must be a valid URL".to_string()))?;
+    if url.scheme() != "https" {
+        return Err(AppError::BadRequest(
+            "callback.url must use https".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::BadRequest(
+            "callback.url must not include credentials".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(AppError::BadRequest(
+            "callback.url must not include fragments".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::BadRequest("callback.url must include a hostname".to_string()))?;
+    if !config.is_callback_host_allowed(host) {
+        return Err(AppError::BadRequest(
+            "callback.url host is not allowlisted".to_string(),
+        ));
+    }
+
+    Ok(url)
 }
 
 async fn upsert_callback_for_task(
@@ -2182,7 +2341,7 @@ async fn upsert_callback_for_task(
     .execute(&mut *tx)
     .await?;
 
-    let callback_id = register_callback(&mut tx, task_id, callback).await?;
+    let callback_id = register_callback(&state.config, &mut tx, task_id, callback).await?;
 
     sqlx::query(
         r#"
@@ -2293,7 +2452,10 @@ async fn bump_or_get_agent_permission_version(
     }
 }
 
-async fn current_agent_permission_version(state: &AppState, agent_id: &str) -> Result<i64, AppError> {
+async fn current_agent_permission_version(
+    state: &AppState,
+    agent_id: &str,
+) -> Result<i64, AppError> {
     let row = sqlx::query(
         r#"
         SELECT version
@@ -2309,6 +2471,100 @@ async fn current_agent_permission_version(state: &AppState, agent_id: &str) -> R
     Ok(row
         .and_then(|row| row.try_get::<i64, _>("version").ok())
         .unwrap_or(1))
+}
+
+fn issue_approval_nonce_token(
+    config: &crate::config::Config,
+    approval_id: &str,
+    expires_at: chrono::DateTime<Utc>,
+) -> Result<String, AppError> {
+    let now = Utc::now().timestamp() as usize;
+    let claims = ApprovalNonceClaims {
+        iss: config.jwt_issuer.clone(),
+        sub: format!("approval:{approval_id}"),
+        aud: "approval_link".to_string(),
+        jti: new_id("anonce"),
+        iat: now,
+        nbf: now,
+        exp: expires_at.timestamp() as usize,
+        approval_id: approval_id.to_string(),
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(config.approval_link_secret.as_bytes()),
+    )
+    .map_err(|e| AppError::internal(format!("failed to sign approval nonce token: {e}")))
+}
+
+fn decode_approval_nonce_token(
+    config: &crate::config::Config,
+    approval_nonce_token: &str,
+) -> Result<ApprovalNonceClaims, AppError> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_audience(&["approval_link"]);
+    validation.set_issuer(std::slice::from_ref(&config.jwt_issuer));
+    validation.leeway = 30;
+
+    decode::<ApprovalNonceClaims>(
+        approval_nonce_token,
+        &DecodingKey::from_secret(config.approval_link_secret.as_bytes()),
+        &validation,
+    )
+    .map(|decoded| decoded.claims)
+    .map_err(|_| AppError::Unauthorized("invalid approval link token".to_string()))
+}
+
+fn issue_resume_token(
+    config: &crate::config::Config,
+    approval_id: &str,
+    task_id: &str,
+    operation_fingerprint: &str,
+    expires_at: chrono::DateTime<Utc>,
+) -> Result<String, AppError> {
+    let now = Utc::now().timestamp() as usize;
+    let claims = ResumeTokenClaims {
+        iss: config.jwt_issuer.clone(),
+        sub: format!("approval:{approval_id}"),
+        aud: "resume".to_string(),
+        jti: new_id("resume"),
+        iat: now,
+        nbf: now,
+        exp: expires_at.timestamp() as usize,
+        approval_id: approval_id.to_string(),
+        task_id: task_id.to_string(),
+        operation_fingerprint: operation_fingerprint.to_string(),
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(config.resume_token_secret.as_bytes()),
+    )
+    .map_err(|e| AppError::internal(format!("failed to sign resume token: {e}")))
+}
+
+fn decode_resume_token(
+    config: &crate::config::Config,
+    resume_token: &str,
+) -> Result<ResumeTokenValidation, AppError> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_audience(&["resume"]);
+    validation.set_issuer(std::slice::from_ref(&config.jwt_issuer));
+    validation.leeway = 30;
+
+    let claims = decode::<ResumeTokenClaims>(
+        resume_token,
+        &DecodingKey::from_secret(config.resume_token_secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|_| AppError::Unauthorized("invalid resume token".to_string()))?
+    .claims;
+
+    Ok(ResumeTokenValidation {
+        approval_id: claims.approval_id,
+        task_id: claims.task_id,
+        operation_fingerprint: claims.operation_fingerprint,
+    })
 }
 
 fn canonical_fingerprint(value: &Value) -> Result<String, AppError> {
@@ -2348,7 +2604,9 @@ fn str_to_permission_level(value: &str) -> Result<PermissionLevel, AppError> {
         "read" => Ok(PermissionLevel::Read),
         "write" => Ok(PermissionLevel::Write),
         "admin" => Ok(PermissionLevel::Admin),
-        _ => Err(AppError::Internal(format!("invalid permission level: {value}"))),
+        _ => Err(AppError::Internal(format!(
+            "invalid permission level: {value}"
+        ))),
     }
 }
 

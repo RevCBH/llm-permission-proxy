@@ -63,15 +63,6 @@ static OPERATION_CATALOG: Lazy<HashMap<&'static str, OperationCatalogEntry>> = L
             risk_tier: RiskTier::Sensitive,
         },
     );
-    map.insert(
-        "permissions.admin",
-        OperationCatalogEntry {
-            operation_id: "permissions.admin",
-            required_level: PermissionLevel::Admin,
-            risk_tier: RiskTier::Sensitive,
-        },
-    );
-
     map
 });
 
@@ -87,4 +78,31 @@ pub fn is_sensitive_risk(operation_id: &str) -> bool {
 
 pub fn all_catalog_operations() -> Vec<&'static str> {
     OPERATION_CATALOG.keys().copied().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{all_catalog_operations, is_sensitive_risk, operation_catalog_entry};
+    use crate::models::{PermissionLevel, RiskTier};
+
+    #[test]
+    fn lookup_returns_expected_entry() {
+        let entry = operation_catalog_entry("dns.record.write").expect("entry should exist");
+        assert_eq!(entry.required_level, PermissionLevel::Write);
+        assert_eq!(entry.risk_tier, RiskTier::Elevated);
+    }
+
+    #[test]
+    fn sensitive_classification_matches_catalog() {
+        assert!(is_sensitive_risk("workers.deploy.write"));
+        assert!(!is_sensitive_risk("dns.record.read"));
+    }
+
+    #[test]
+    fn catalog_contains_required_core_operations() {
+        let all = all_catalog_operations();
+        assert!(all.contains(&"dns.record.read"));
+        assert!(all.contains(&"cache.purge.execute"));
+        assert!(!all.contains(&"permissions.admin"));
+    }
 }

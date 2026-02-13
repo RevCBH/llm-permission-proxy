@@ -25,6 +25,47 @@ pub struct CapabilityClaims {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub jti: String,
+    pub iat: usize,
+    pub nbf: usize,
+    pub exp: usize,
+    pub bindings: CapabilityBindings,
+    pub can_issue_tasks: bool,
+    pub can_manage_permissions: bool,
+    pub can_manage_approvers: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalNonceClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub jti: String,
+    pub iat: usize,
+    pub nbf: usize,
+    pub exp: usize,
+    pub approval_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeTokenClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub jti: String,
+    pub iat: usize,
+    pub nbf: usize,
+    pub exp: usize,
+    pub approval_id: String,
+    pub task_id: String,
+    pub operation_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceScope {
     pub kind: String,
     pub id: String,

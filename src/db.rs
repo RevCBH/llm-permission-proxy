@@ -4,7 +4,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use sqlx::{SqlitePool, sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
 use uuid::Uuid;
 
 use crate::{config::Config, error::AppError};
@@ -28,7 +31,6 @@ pub async fn connect_and_bootstrap(config: &Config) -> Result<SqlitePool, AppErr
 
 const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
     "PRAGMA foreign_keys = ON;",
-
     "CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       task_name TEXT NOT NULL,
@@ -40,7 +42,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       created_at DATETIME NOT NULL,
       updated_at DATETIME NOT NULL
     );",
-
     "CREATE TABLE IF NOT EXISTS task_operations (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -52,7 +53,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       created_at DATETIME NOT NULL,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS capability_tokens (
       jti TEXT PRIMARY KEY,
       task_id TEXT,
@@ -62,13 +62,13 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       iss TEXT NOT NULL,
       allowed_ops_json TEXT NOT NULL,
       resource_scopes_json TEXT NOT NULL,
+      claims_hash TEXT NOT NULL,
       expires_at DATETIME NOT NULL,
       revoked_at DATETIME,
       rev INTEGER NOT NULL,
       created_at DATETIME NOT NULL,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
     );",
-
     "CREATE TABLE IF NOT EXISTS agent_permissions (
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL,
@@ -83,7 +83,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       created_at DATETIME NOT NULL,
       updated_at DATETIME NOT NULL
     );",
-
     "CREATE TABLE IF NOT EXISTS agent_permission_version (
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL UNIQUE,
@@ -91,7 +90,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       created_at DATETIME NOT NULL,
       updated_at DATETIME NOT NULL
     );",
-
     "CREATE TABLE IF NOT EXISTS task_permission_snapshot (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -102,7 +100,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       snapshot_ttl_at DATETIME,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS permission_evaluations (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -114,7 +111,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       created_at DATETIME NOT NULL,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS idempotency_records (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -131,15 +127,10 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       UNIQUE(task_id, idempotency_key_hash),
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
       approval_id TEXT NOT NULL UNIQUE,
-      nonce_hash TEXT NOT NULL UNIQUE,
-      nonce_plain TEXT NOT NULL,
-      resume_token_hash TEXT NOT NULL,
-      resume_token_plain TEXT NOT NULL,
       state TEXT NOT NULL,
       expires_at DATETIME NOT NULL,
       operation_fingerprint TEXT NOT NULL,
@@ -153,7 +144,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       updated_at DATETIME NOT NULL,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS webauthn_challenges (
       id TEXT PRIMARY KEY,
       approval_id TEXT NOT NULL,
@@ -164,7 +154,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       used_at DATETIME,
       FOREIGN KEY(approval_id) REFERENCES approvals(approval_id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS approver_credentials (
       id TEXT PRIMARY KEY,
       approver_principal TEXT NOT NULL,
@@ -177,7 +166,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       updated_at DATETIME NOT NULL,
       UNIQUE(approver_principal, credential_id)
     );",
-
     "CREATE TABLE IF NOT EXISTS callbacks (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -190,7 +178,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       last_error TEXT,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS callback_deliveries (
       id TEXT PRIMARY KEY,
       callback_id TEXT NOT NULL,
@@ -205,7 +192,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       updated_at DATETIME NOT NULL,
       FOREIGN KEY(callback_id) REFERENCES callbacks(id) ON DELETE CASCADE
     );",
-
     "CREATE TABLE IF NOT EXISTS audit_events (
       id TEXT PRIMARY KEY,
       ts DATETIME NOT NULL,
@@ -222,7 +208,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       signature TEXT,
       correlation_id TEXT
     );",
-
     "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);",
     "CREATE INDEX IF NOT EXISTS idx_capability_task ON capability_tokens(task_id);",
     "CREATE INDEX IF NOT EXISTS idx_capability_expires ON capability_tokens(expires_at);",
@@ -238,8 +223,6 @@ const SCHEMA_BOOTSTRAP_SQL: &[&str] = &[
       ON idempotency_records(task_id, idempotency_key_hash);",
     "CREATE INDEX IF NOT EXISTS idx_approvals_task_state
       ON approvals(task_id, state, created_at);",
-    "CREATE INDEX IF NOT EXISTS idx_approvals_nonce_hash
-      ON approvals(nonce_hash);",
     "CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_approval
       ON webauthn_challenges(approval_id, used_at, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_callback_deliveries_due
@@ -279,4 +262,91 @@ pub fn random_token(byte_len: usize) -> String {
 
 pub fn utc_now() -> chrono::DateTime<Utc> {
     Utc::now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{connect_and_bootstrap, new_id, random_token, sha256_hex, sha256_hex_bytes};
+    use crate::config::Config;
+    use sqlx::Row;
+    use tempfile::TempDir;
+
+    fn test_config(database_url: String) -> Config {
+        Config {
+            bind_addr: "127.0.0.1:0".to_string(),
+            database_url,
+            jwt_secret: "secret".to_string(),
+            jwt_issuer: "issuer".to_string(),
+            jwt_audience: "aud".to_string(),
+            bootstrap_jwt_secret: "bootstrap-secret".to_string(),
+            bootstrap_jwt_issuer: "bootstrap-issuer".to_string(),
+            bootstrap_jwt_audience: "bootstrap-audience".to_string(),
+            mtls_binding_shared_secret: "mtls-secret".to_string(),
+            approval_link_secret: "approval-secret".to_string(),
+            resume_token_secret: "resume-secret".to_string(),
+            base_url: "http://localhost".to_string(),
+            callback_allowed_hosts: ["localhost".to_string()].into_iter().collect(),
+            callback_max_retries: 3,
+            callback_batch_size: 25,
+            callback_worker_interval_secs: 1,
+            approval_ttl_seconds: 300,
+            approval_nonce_ttl_seconds: 60,
+            webauthn_rp_id: "localhost".to_string(),
+            webauthn_origin: "http://localhost".to_string(),
+            cloudflare_api_token: None,
+            cloudflare_api_base: "https://api.cloudflare.com/client/v4".to_string(),
+            allow_insecure_defaults: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_and_bootstrap_creates_required_columns() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        let db_path = temp.path().join("bootstrap.db");
+        let cfg = test_config(format!("sqlite://{}", db_path.display()));
+
+        let pool = connect_and_bootstrap(&cfg)
+            .await
+            .expect("bootstrap should succeed");
+
+        let rows = sqlx::query("PRAGMA table_info(approver_credentials)")
+            .fetch_all(&pool)
+            .await
+            .expect("pragma should work");
+
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            seen.insert(
+                row.try_get::<String, _>("name")
+                    .expect("column name should parse"),
+            );
+        }
+
+        assert!(seen.contains("algorithm"));
+        assert!(seen.contains("public_key_format"));
+        assert!(seen.contains("public_key_b64"));
+    }
+
+    #[test]
+    fn new_id_uses_prefix() {
+        let id = new_id("task");
+        assert!(id.starts_with("task_"));
+    }
+
+    #[test]
+    fn hash_helpers_are_deterministic() {
+        assert_eq!(sha256_hex("abc"), sha256_hex("abc"));
+        assert_eq!(sha256_hex_bytes(b"abc"), sha256_hex("abc"));
+    }
+
+    #[test]
+    fn random_token_is_url_safe_without_padding() {
+        let token = random_token(24);
+        assert!(!token.contains('='));
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+    }
 }
