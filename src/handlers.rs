@@ -33,7 +33,7 @@ use crate::{
     },
     policy::operation_catalog_entry,
     state::AppState,
-    webauthn::verify_client_data_json,
+    webauthn::{validate_webauthn_credential_key, verify_assertion},
 };
 
 pub fn router(state: AppState) -> Router {
@@ -779,7 +779,7 @@ async fn get_approver_credentials(
 
     let rows = sqlx::query(
         r#"
-        SELECT credential_id, status
+        SELECT credential_id, status, algorithm, public_key_format, public_key_b64
         FROM approver_credentials
         WHERE approver_principal = ?1
         ORDER BY created_at DESC
@@ -791,9 +791,13 @@ async fn get_approver_credentials(
 
     let mut credentials = Vec::new();
     for row in rows {
+        let public_key_b64: String = row.try_get("public_key_b64")?;
         credentials.push(ApproverCredentialItem {
             credential_id: row.try_get("credential_id")?,
             status: row.try_get("status")?,
+            algorithm: row.try_get("algorithm")?,
+            public_key_format: row.try_get("public_key_format")?,
+            public_key_thumbprint: Some(sha256_hex(&public_key_b64)),
         });
     }
 
@@ -824,6 +828,19 @@ async fn upsert_approver_credential(
             "status must be active or inactive".to_string(),
         ));
     }
+    if payload.public_key_b64.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "public_key_b64 is required".to_string(),
+        ));
+    }
+
+    let algorithm = payload.algorithm.clone().unwrap_or_else(|| "ES256".to_string());
+    let public_key_format = payload
+        .public_key_format
+        .clone()
+        .unwrap_or_else(|| "cose".to_string());
+
+    validate_webauthn_credential_key(&algorithm, &public_key_format, &payload.public_key_b64)?;
 
     let now = Utc::now();
 
@@ -834,17 +851,23 @@ async fn upsert_approver_credential(
           approver_principal,
           credential_id,
           status,
+          algorithm,
+          public_key_format,
+          public_key_b64,
           created_at,
           updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
         ON CONFLICT(approver_principal, credential_id)
-        DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
+        DO UPDATE SET status = excluded.status, algorithm = excluded.algorithm, public_key_format = excluded.public_key_format, public_key_b64 = excluded.public_key_b64, updated_at = excluded.updated_at
         "#,
     )
     .bind(new_id("ac"))
     .bind(approver_principal.clone())
     .bind(payload.credential_id)
     .bind(payload.status)
+    .bind(algorithm)
+    .bind(public_key_format)
+    .bind(payload.public_key_b64)
     .bind(now)
     .execute(&state.db)
     .await?;
@@ -1130,9 +1153,9 @@ async fn approval_verify(
         return Err(AppError::Gone("challenge expired".to_string()));
     }
 
-    let credential_exists = sqlx::query(
+    let credential = sqlx::query(
         r#"
-        SELECT id
+        SELECT algorithm, public_key_format, public_key_b64
         FROM approver_credentials
         WHERE approver_principal = ?1
           AND credential_id = ?2
@@ -1143,19 +1166,26 @@ async fn approval_verify(
     .bind(approver_principal)
     .bind(payload.credential_id.clone())
     .fetch_optional(&mut *tx)
-    .await?
-    .is_some();
+    .await?;
 
-    if !credential_exists {
-        return Err(AppError::Forbidden(
-            "credential is not registered for approver".to_string(),
-        ));
-    }
+    let row = credential.ok_or_else(|| {
+        AppError::Forbidden("credential is not registered for approver".to_string())
+    })?;
+    let algorithm: String = row.try_get("algorithm")?;
+    let public_key_format: String = row.try_get("public_key_format")?;
+    let public_key_b64: String = row.try_get("public_key_b64")?;
 
-    verify_client_data_json(
+    verify_assertion(
         &payload.client_data_json,
         &challenge,
         &state.config.webauthn_origin,
+        &state.config.webauthn_rp_id,
+        true,
+        &algorithm,
+        &public_key_format,
+        &public_key_b64,
+        &payload.authenticator_data,
+        &payload.signature,
     )?;
 
     sqlx::query(

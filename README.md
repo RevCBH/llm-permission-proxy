@@ -29,5 +29,12 @@ Rust + SQLite proxy for Cloudflare operations with explicit async approval flow.
 
 ## Notes
 
-- WebAuthn verify endpoint currently validates challenge/origin/credential binding and assertion presence.
-- For production passkey assurance, add full cryptographic signature verification against stored credential public keys.
+- WebAuthn verification is production-grade for ES256.
+- `/v1/approve/{approval_nonce}/verify` validates full assertions:
+  - `client_data_json` (`type`, challenge, and origin),
+  - `authenticator_data` (rpId hash and user-presence / user-verification bits),
+  - ECDSA signature over `authenticator_data || SHA-256(client_data_json)`.
+- Approver credentials are stored in SQLite bootstrap schema (no migrations) with:
+  - `public_key_b64`
+  - `algorithm` (defaults/validated as `ES256`)
+  - `public_key_format` (defaults/validated as `cose`)

@@ -17,7 +17,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_cbor = "0.11"
 sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "json"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

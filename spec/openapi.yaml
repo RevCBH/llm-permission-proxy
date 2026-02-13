@@ -52,8 +52,15 @@ paths:
   /approvers/{approver_principal}/credentials:
     get:
       summary: List passkey credential IDs for approver principal
+      description: >
+        Returns active/inactive approver credentials plus verifier metadata
+        (`algorithm`, `public_key_format`, and key fingerprint) for admin
+        visibility.
     post:
       summary: Upsert passkey credential status for approver principal
+      description: >
+        Stores credential metadata required for production passkey verification
+        (`public_key_b64`, optional `algorithm`, optional `public_key_format`).
   /approve/{approval_nonce}:
     get:
       summary: Approval UI page
@@ -63,3 +70,7 @@ paths:
   /approve/{approval_nonce}/verify:
     post:
       summary: Verify WebAuthn assertion and approve
+      description: >
+        Verifies full WebAuthn assertion including clientDataJSON validation,
+        authenticatorData validation (rpIdHash and user presence/verification flags),
+        and ES256 signature verification against stored credential public key material.

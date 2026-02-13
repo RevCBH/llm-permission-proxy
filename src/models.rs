@@ -240,6 +240,12 @@ pub struct PatchAgentPermissionsRequest {
 pub struct ApproverCredentialItem {
     pub credential_id: String,
     pub status: String,
+    #[serde(default = "default_credential_algorithm")]
+    pub algorithm: String,
+    #[serde(default = "default_credential_key_format")]
+    pub public_key_format: String,
+    #[serde(default)]
+    pub public_key_thumbprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,8 +257,21 @@ pub struct ApproverCredentialsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsertApproverCredentialRequest {
     pub credential_id: String,
+    pub public_key_b64: String,
     #[serde(default = "default_credential_status")]
     pub status: String,
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    #[serde(default)]
+    pub public_key_format: Option<String>,
+}
+
+fn default_credential_algorithm() -> String {
+    "ES256".to_string()
+}
+
+fn default_credential_key_format() -> String {
+    "cose".to_string()
 }
 
 fn default_credential_status() -> String {

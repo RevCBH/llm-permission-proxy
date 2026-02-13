@@ -14,7 +14,7 @@ use axum::Router;
 use reqwest::Client;
 use tracing::info;
 
-use crate::{callbacks::start_callback_worker, cf::CloudflareExecutor, config::Config, db::connect_and_migrate, handlers::router, state::AppState};
+use crate::{callbacks::start_callback_worker, cf::CloudflareExecutor, config::Config, db::connect_and_bootstrap, handlers::router, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
-    let db = connect_and_migrate(&config).await?;
+    let db = connect_and_bootstrap(&config).await?;
     let http_client = Client::builder().build()?;
 
     let cf_executor = CloudflareExecutor::new(
