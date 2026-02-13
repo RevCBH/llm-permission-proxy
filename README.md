@@ -38,3 +38,18 @@ Rust + SQLite proxy for Cloudflare operations with explicit async approval flow.
   - `public_key_b64`
   - `algorithm` (defaults/validated as `ES256`)
   - `public_key_format` (defaults/validated as `cose`)
+
+## Smoke test (no migrations)
+
+Run a quick startup + schema bootstrap check:
+
+```bash
+./scripts/bootstrap_sqlite_smoke_test.sh
+```
+
+What it verifies:
+- Server starts successfully and `/v1/readyz` responds.
+- SQLite schema is created with `approver_credentials`.
+- `approver_credentials.algorithm`, `approver_credentials.public_key_format`, and
+  `approver_credentials.public_key_b64` exist.
+- No legacy `sqlx` migration table is present.
