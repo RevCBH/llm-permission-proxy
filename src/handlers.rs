@@ -38,28 +38,28 @@ use crate::{
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
-        .route("/v1/tasks/:task_id", get(get_task))
-        .route("/v1/tasks/:task_id/plan", post(plan_task))
-        .route("/v1/tasks/:task_id/apply", post(apply_task))
-        .route("/v1/tasks/:task_id/apply/continue", post(continue_apply_task))
-        .route("/v1/tasks/:task_id/approval-status", get(get_approval_status))
-        .route("/v1/tasks/:task_id/approve", post(create_approval_for_task))
+        .route("/v1/tasks/{task_id}", get(get_task))
+        .route("/v1/tasks/{task_id}/plan", post(plan_task))
+        .route("/v1/tasks/{task_id}/apply", post(apply_task))
+        .route("/v1/tasks/{task_id}/apply/continue", post(continue_apply_task))
+        .route("/v1/tasks/{task_id}/approval-status", get(get_approval_status))
+        .route("/v1/tasks/{task_id}/approve", post(create_approval_for_task))
         .route(
-            "/v1/tasks/:task_id/approve/discord-message",
+            "/v1/tasks/{task_id}/approve/discord-message",
             get(get_discord_approval_message),
         )
-        .route("/v1/tasks/:task_id/close", post(close_task))
-        .route("/v1/tasks/:task_id/dns/create", post(dns_create))
-        .route("/v1/tasks/:task_id/cache/purge", post(cache_purge))
-        .route("/v1/tasks/:task_id/workers/deploy", post(workers_deploy))
-        .route("/v1/agents/:agent_id/permissions", get(get_agent_permissions))
-        .route("/v1/agents/:agent_id/permissions", patch(patch_agent_permissions))
+        .route("/v1/tasks/{task_id}/close", post(close_task))
+        .route("/v1/tasks/{task_id}/dns/create", post(dns_create))
+        .route("/v1/tasks/{task_id}/cache/purge", post(cache_purge))
+        .route("/v1/tasks/{task_id}/workers/deploy", post(workers_deploy))
+        .route("/v1/agents/{agent_id}/permissions", get(get_agent_permissions))
+        .route("/v1/agents/{agent_id}/permissions", patch(patch_agent_permissions))
         .route(
-            "/v1/approvers/:approver_principal/credentials",
+            "/v1/approvers/{approver_principal}/credentials",
             get(get_approver_credentials),
         )
         .route(
-            "/v1/approvers/:approver_principal/credentials",
+            "/v1/approvers/{approver_principal}/credentials",
             post(upsert_approver_credential),
         )
         .layer(axum::middleware::from_fn_with_state(
@@ -71,9 +71,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/healthz", get(healthz))
         .route("/v1/readyz", get(readyz))
         .route("/v1/tasks", post(create_task))
-        .route("/v1/approve/:approval_nonce", get(approval_page))
-        .route("/v1/approve/:approval_nonce/options", get(approval_options))
-        .route("/v1/approve/:approval_nonce/verify", post(approval_verify))
+        .route("/v1/approve/{approval_nonce}", get(approval_page))
+        .route("/v1/approve/{approval_nonce}/options", get(approval_options))
+        .route("/v1/approve/{approval_nonce}/verify", post(approval_verify))
         .merge(protected)
         .with_state(state)
 }
@@ -245,10 +245,12 @@ async fn create_task(
     .bind(chrono::DateTime::from_timestamp(claims.exp as i64, 0).ok_or_else(|| {
         AppError::internal("failed to construct capability expiry timestamp")
     })?)
-    .bind(perms_rev)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
+        .bind(perms_rev)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+    let callback_id = None::<String>;
 
     tx.commit().await?;
 
@@ -409,7 +411,16 @@ async fn create_approval_for_task(
     )
     .await?;
 
-    Ok((StatusCode::CREATED, Json(approval)))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateApprovalResponse {
+            task_id,
+            approval_id: approval.approval_id,
+            approval_url: approval.approval_url,
+            approval_status_url: approval.approval_status_url,
+            expires_at: approval.expires_at,
+        }),
+    ))
 }
 
 async fn get_discord_approval_message(
@@ -1986,8 +1997,10 @@ async fn fetch_approval_by_id(
 struct PendingApprovalCreateResult {
     approval_id: String,
     approval_status_url: String,
+    approval_url: String,
     resume_token: String,
     callback_id: Option<String>,
+    expires_at: chrono::DateTime<Utc>,
 }
 
 async fn create_or_get_pending_approval(
@@ -2001,7 +2014,7 @@ async fn create_or_get_pending_approval(
 
     let existing = sqlx::query(
         r#"
-        SELECT approval_id, nonce_plain, resume_token_plain
+        SELECT approval_id, nonce_plain, resume_token_plain, expires_at
         FROM approvals
         WHERE task_id = ?1
           AND operation_fingerprint = ?2
@@ -2023,20 +2036,25 @@ async fn create_or_get_pending_approval(
 
     if let Some(row) = existing {
         let approval_id: String = row.try_get("approval_id")?;
+        let nonce_plain: String = row.try_get("nonce_plain")?;
         let resume_token: String = row.try_get("resume_token_plain")?;
+        let expires_at: chrono::DateTime<Utc> = row.try_get("expires_at")?;
         tx.commit().await?;
 
         return Ok(PendingApprovalCreateResult {
             approval_id,
             approval_status_url: format!("/v1/tasks/{task_id}/approval-status"),
+            approval_url: format!("/v1/approve/{nonce_plain}"),
             resume_token,
             callback_id,
+            expires_at,
         });
     }
 
     let approval_id = new_id("appr");
     let nonce_plain = random_token(24);
     let resume_token_plain = random_token(24);
+    let approval_url = format!("/v1/approve/{nonce_plain}");
 
     let nonce_hash = sha256_hex(&nonce_plain);
     let resume_token_hash = sha256_hex(&resume_token_plain);
@@ -2066,7 +2084,7 @@ async fn create_or_get_pending_approval(
     .bind(task_id)
     .bind(approval_id.clone())
     .bind(nonce_hash)
-    .bind(nonce_plain)
+    .bind(&nonce_plain)
     .bind(resume_token_hash)
     .bind(resume_token_plain.clone())
     .bind(expires_at)
@@ -2077,32 +2095,15 @@ async fn create_or_get_pending_approval(
     .execute(&mut *tx)
     .await?;
 
-    let callback_id = if let Some(callback) = payload.callback.as_ref() {
-        let callback_id = register_callback(&mut tx, &task_id, callback).await?;
-        sqlx::query(
-            r#"
-            UPDATE tasks
-            SET callback_id = ?1, updated_at = ?2
-            WHERE id = ?3
-            "#,
-        )
-        .bind(callback_id.clone())
-        .bind(Utc::now())
-        .bind(task_id.clone())
-        .execute(&mut *tx)
-        .await?;
-        Some(callback_id)
-    } else {
-        None
-    };
-
     tx.commit().await?;
 
     Ok(PendingApprovalCreateResult {
         approval_id,
         approval_status_url: format!("/v1/tasks/{task_id}/approval-status"),
+        approval_url,
         resume_token: resume_token_plain,
         callback_id,
+        expires_at,
     })
 }
 
@@ -2111,6 +2112,8 @@ async fn register_callback(
     task_id: &str,
     callback: &CallbackRegistrationInput,
 ) -> Result<String, AppError> {
+    let tx = &mut **tx;
+
     if callback.url.trim().is_empty() {
         return Err(AppError::BadRequest("callback.url is required".to_string()));
     }
@@ -2144,8 +2147,8 @@ async fn register_callback(
           created_at,
           updated_at,
           last_error
-        ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL)
-        "#,
+    ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL)
+    "#,
     )
     .bind(callback_id.clone())
     .bind(task_id)
@@ -2153,7 +2156,7 @@ async fn register_callback(
     .bind(callback.secret.clone())
     .bind(serde_json::to_string(&events).map_err(AppError::internal)?)
     .bind(Utc::now())
-    .execute(&mut *tx)
+    .execute(tx)
     .await?;
 
     Ok(callback_id)
@@ -2204,6 +2207,8 @@ async fn fetch_agent_permissions_raw(
     tx: &mut Transaction<'_, Sqlite>,
     agent_id: &str,
 ) -> Result<Value, AppError> {
+    let tx = &mut **tx;
+
     let rows = sqlx::query(
         r#"
         SELECT operation_id, scope_type, scope_id, granted_level, expires_at
@@ -2216,7 +2221,7 @@ async fn fetch_agent_permissions_raw(
     )
     .bind(agent_id)
     .bind(Utc::now())
-    .fetch_all(&mut *tx)
+    .fetch_all(tx)
     .await?;
 
     let mut values = Vec::new();
@@ -2247,7 +2252,7 @@ async fn bump_or_get_agent_permission_version(
         "#,
     )
     .bind(agent_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     if let Some(row) = row {
@@ -2264,7 +2269,7 @@ async fn bump_or_get_agent_permission_version(
             .bind(next)
             .bind(Utc::now())
             .bind(agent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             Ok(next)
         } else {
@@ -2282,7 +2287,7 @@ async fn bump_or_get_agent_permission_version(
         .bind(agent_id)
         .bind(initial)
         .bind(Utc::now())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         Ok(initial)
     }
