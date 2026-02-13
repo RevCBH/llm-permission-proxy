@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/capability-token.schema.json",
+  "type": "object",
+  "required": [
+    "iss",
+    "sub",
+    "aud",
+    "jti",
+    "iat",
+    "nbf",
+    "exp",
+    "agent_id",
+    "allowed_ops",
+    "resource_scopes",
+    "bindings",
+    "perms_rev"
+  ],
+  "properties": {
+    "iss": { "type": "string" },
+    "sub": { "type": "string" },
+    "aud": { "type": "string" },
+    "jti": { "type": "string" },
+    "iat": { "type": "integer" },
+    "nbf": { "type": "integer" },
+    "exp": { "type": "integer" },
+    "task_id": { "type": ["string", "null"] },
+    "agent_id": { "type": "string" },
+    "allowed_ops": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "resource_scopes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "id"],
+        "properties": {
+          "kind": { "type": "string" },
+          "id": { "type": "string" }
+        }
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "required": ["mtls_subject"],
+      "properties": {
+        "mtls_subject": { "type": "string" }
+      }
+    },
+    "perms_rev": { "type": "integer" }
+  }
+}

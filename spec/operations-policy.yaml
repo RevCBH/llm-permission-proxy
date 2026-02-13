@@ -1,0 +1,29 @@
+operations:
+  dns.record.read:
+    required_level: read
+    risk_tier: safe
+    scope_type: zone
+  dns.record.write:
+    required_level: write
+    risk_tier: elevated
+    scope_type: zone
+  cache.purge.execute:
+    required_level: write
+    risk_tier: elevated
+    scope_type: zone
+  workers.deploy.write:
+    required_level: write
+    risk_tier: sensitive
+    scope_type: account
+  waf.rules.read:
+    required_level: read
+    risk_tier: safe
+    scope_type: zone
+  waf.rules.write:
+    required_level: write
+    risk_tier: sensitive
+    scope_type: zone
+  ssl.mode.write:
+    required_level: admin
+    risk_tier: sensitive
+    scope_type: zone

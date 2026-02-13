@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: LLM Permission Proxy API
+  version: 0.1.0
+servers:
+  - url: https://proxy.internal/v1
+paths:
+  /tasks:
+    post:
+      summary: Create task and issue capability token
+  /tasks/{task_id}:
+    get:
+      summary: Get task
+      parameters:
+        - in: path
+          name: task_id
+          required: true
+          schema:
+            type: string
+  /tasks/{task_id}/plan:
+    post:
+      summary: Plan operation and evaluate approval requirement
+  /tasks/{task_id}/apply:
+    post:
+      summary: Apply operation or return requires_approval
+  /tasks/{task_id}/apply/continue:
+    post:
+      summary: Resume apply after approval
+  /tasks/{task_id}/approval-status:
+    get:
+      summary: Get approval state
+  /tasks/{task_id}/approve:
+    post:
+      summary: Create approval request
+  /tasks/{task_id}/approve/discord-message:
+    get:
+      summary: Get Discord approval message payload
+  /tasks/{task_id}/dns/create:
+    post:
+      summary: Convenience DNS create endpoint
+  /tasks/{task_id}/cache/purge:
+    post:
+      summary: Convenience cache purge endpoint
+  /tasks/{task_id}/workers/deploy:
+    post:
+      summary: Convenience workers deploy endpoint
+  /agents/{agent_id}/permissions:
+    get:
+      summary: Read pre-approved permissions
+    patch:
+      summary: Replace pre-approved permissions
+  /approvers/{approver_principal}/credentials:
+    get:
+      summary: List passkey credential IDs for approver principal
+    post:
+      summary: Upsert passkey credential status for approver principal
+  /approve/{approval_nonce}:
+    get:
+      summary: Approval UI page
+  /approve/{approval_nonce}/options:
+    get:
+      summary: WebAuthn challenge options
+  /approve/{approval_nonce}/verify:
+    post:
+      summary: Verify WebAuthn assertion and approve
